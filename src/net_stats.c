@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -548,6 +549,19 @@ static inline int net_stats_bond_debug_enabled(void)
     return enabled;
 }
 
+static inline int net_stats_wallclock_enabled(void)
+{
+    static int enabled = -1;
+    const char *val;
+
+    if (enabled != -1) {
+        return enabled;
+    }
+    val = getenv("DPERF_STATS_WALLCLOCK");
+    enabled = (val != NULL && val[0] != '\0' && val[0] != '0');
+    return enabled;
+}
+
 static void net_stats_print_bond_debug(FILE *fp)
 {
     struct netif_port *port = NULL;
@@ -603,25 +617,9 @@ static void net_stats_print_bond_debug(FILE *fp)
         for (i = 0; i < slave_num; i++) {
             uint16_t sid = port->port_id_list[i];
             struct rte_eth_link link;
-            int collect = -1;
-            int distrib = -1;
 
             memset(&link, 0, sizeof(link));
             rte_eth_link_get_nowait(sid, &link);
-            if (port->bond_mode == BONDING_MODE_8023AD) {
-                collect = rte_eth_bond_8023ad_ext_collect_get(port->id, sid);
-                distrib = rte_eth_bond_8023ad_ext_distrib_get(port->id, sid);
-            }
-
-            if (fp) {
-                fprintf(fp, "  slave %u link %s %uMbps collect %d distrib %d\n",
-                        sid, link.link_status ? "up" : "down",
-                        link.link_speed, collect, distrib);
-            } else {
-                printf("  slave %u link %s %uMbps collect %d distrib %d\n",
-                       sid, link.link_status ? "up" : "down",
-                       link.link_speed, collect, distrib);
-            }
 
             if (port->bond_mode == BONDING_MODE_8023AD) {
                 struct rte_eth_bond_8023ad_slave_info info;
@@ -632,6 +630,27 @@ static void net_stats_print_bond_debug(FILE *fp)
                     int sync = !!(info.actor_state & STATE_SYNCHRONIZATION);
                     int expired = !!(info.actor_state & STATE_EXPIRED);
                     int defaulted = !!(info.actor_state & STATE_DEFAULTED);
+                    int collect = !!(info.actor_state & STATE_COLLECTING);
+                    int distrib = !!(info.actor_state & STATE_DISTRIBUTING);
+                    int p_sync = !!(info.partner_state & STATE_SYNCHRONIZATION);
+                    int p_expired = !!(info.partner_state & STATE_EXPIRED);
+                    int p_defaulted = !!(info.partner_state & STATE_DEFAULTED);
+                    int p_collect = !!(info.partner_state & STATE_COLLECTING);
+                    int p_distrib = !!(info.partner_state & STATE_DISTRIBUTING);
+
+                    if (fp) {
+                        fprintf(fp, "  slave %u link %s %uMbps actor[c=%d d=%d sync=%d expired=%d defaulted=%d timeout=%s] partner[c=%d d=%d sync=%d expired=%d defaulted=%d]\n",
+                                sid, link.link_status ? "up" : "down",
+                                link.link_speed,
+                                collect, distrib, sync, expired, defaulted, timeout,
+                                p_collect, p_distrib, p_sync, p_expired, p_defaulted);
+                    } else {
+                        printf("  slave %u link %s %uMbps actor[c=%d d=%d sync=%d expired=%d defaulted=%d timeout=%s] partner[c=%d d=%d sync=%d expired=%d defaulted=%d]\n",
+                               sid, link.link_status ? "up" : "down",
+                               link.link_speed,
+                               collect, distrib, sync, expired, defaulted, timeout,
+                               p_collect, p_distrib, p_sync, p_expired, p_defaulted);
+                    }
                     if (fp) {
                         fprintf(fp, "    lacp sel %d timeout %s sync %d expired %d defaulted %d actor_state 0x%02x partner_state 0x%02x agg_port %u\n",
                                 info.selected, timeout, sync, expired, defaulted,
@@ -641,6 +660,22 @@ static void net_stats_print_bond_debug(FILE *fp)
                                info.selected, timeout, sync, expired, defaulted,
                                info.actor_state, info.partner_state, info.agg_port_id);
                     }
+                } else {
+                    if (fp) {
+                        fprintf(fp, "  slave %u link %s %uMbps (lacp slave_info unavailable)\n",
+                                sid, link.link_status ? "up" : "down", link.link_speed);
+                    } else {
+                        printf("  slave %u link %s %uMbps (lacp slave_info unavailable)\n",
+                               sid, link.link_status ? "up" : "down", link.link_speed);
+                    }
+                }
+            } else {
+                if (fp) {
+                    fprintf(fp, "  slave %u link %s %uMbps\n",
+                            sid, link.link_status ? "up" : "down", link.link_speed);
+                } else {
+                    printf("  slave %u link %s %uMbps\n",
+                           sid, link.link_status ? "up" : "down", link.link_speed);
                 }
             }
         }
@@ -665,12 +700,22 @@ void net_stats_print_speed(FILE *fp, int seconds)
     int ret = 0;
     int len = NET_STATS_BUF_LEN;
     struct net_stats speed;
+    time_t now;
+    struct tm t;
+    char ts[32];
 
     if (g_config.quiet) {
         return;
     }
 
-    SNPRINTF(p, len, "\nseconds %-18lu", (uint64_t)seconds);
+    if (net_stats_wallclock_enabled()) {
+        now = time(NULL);
+        localtime_r(&now, &t);
+        strftime(ts, sizeof(ts), "%F %T", &t);
+        SNPRINTF(p, len, "\nseconds %-18lu wallclock %s", (uint64_t)seconds, ts);
+    } else {
+        SNPRINTF(p, len, "\nseconds %-18lu", (uint64_t)seconds);
+    }
     net_stats_get_speed(&speed);
     ret = net_stats_cpusage_print(p, len);
     buf_skip(p, len, ret);
