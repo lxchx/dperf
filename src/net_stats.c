@@ -31,6 +31,8 @@
 
 #include <rte_eth_bond.h>
 #include <rte_eth_bond_8023ad.h>
+#include <rte_ethdev.h>
+#include <rte_ether.h>
 
 #include "cpuload.h"
 #include "work_space.h"
@@ -562,6 +564,122 @@ static inline int net_stats_wallclock_enabled(void)
     return enabled;
 }
 
+static inline int net_stats_bond_debug_stats_enabled(void)
+{
+    static int enabled = -1;
+    const char *val;
+
+    if (enabled != -1) {
+        return enabled;
+    }
+    val = getenv("DPERF_BOND_DEBUG_STATS");
+    enabled = (val != NULL && val[0] != '\0' && val[0] != '0');
+    return enabled;
+}
+
+static inline int net_stats_bond_debug_mac_enabled(void)
+{
+    static int enabled = -1;
+    const char *val;
+
+    if (enabled != -1) {
+        return enabled;
+    }
+    val = getenv("DPERF_BOND_DEBUG_MAC");
+    enabled = (val != NULL && val[0] != '\0' && val[0] != '0');
+    return enabled;
+}
+
+static inline uint64_t net_stats_counter_delta(uint64_t cur, uint64_t prev)
+{
+    if (cur >= prev) {
+        return cur - prev;
+    }
+    return cur;
+}
+
+static void net_stats_print_macaddrs(FILE *fp, const char *prefix, uint16_t port_id,
+                                     const struct rte_ether_addr *bond_mac_or_null)
+{
+    struct rte_ether_addr mac;
+    struct rte_ether_addr macs[32];
+    char mac_str[RTE_ETHER_ADDR_FMT_SIZE];
+    char mac2_str[RTE_ETHER_ADDR_FMT_SIZE];
+    int promisc = -1;
+    int allmulti = -1;
+    int n = 0;
+    int i = 0;
+    int has_bond_mac = 0;
+
+    memset(&mac, 0, sizeof(mac));
+    memset(macs, 0, sizeof(macs));
+
+    rte_eth_macaddr_get(port_id, &mac);
+    promisc = rte_eth_promiscuous_get(port_id);
+    allmulti = rte_eth_allmulticast_get(port_id);
+    n = rte_eth_macaddrs_get(port_id, macs, (unsigned int)(sizeof(macs) / sizeof(macs[0])));
+
+    rte_ether_format_addr(mac_str, sizeof(mac_str), &mac);
+
+    if (fp) {
+        fprintf(fp, "%s mac %s promisc %d allmulti %d", prefix, mac_str, promisc, allmulti);
+    } else {
+        printf("%s mac %s promisc %d allmulti %d", prefix, mac_str, promisc, allmulti);
+    }
+
+    if (n < 0) {
+        if (fp) {
+            fprintf(fp, " macaddrs (err %d)\n", n);
+        } else {
+            printf(" macaddrs (err %d)\n", n);
+        }
+        return;
+    }
+
+    if (bond_mac_or_null) {
+        for (i = 0; i < n; i++) {
+            if (rte_is_same_ether_addr(&macs[i], bond_mac_or_null)) {
+                has_bond_mac = 1;
+                break;
+            }
+        }
+    }
+
+    if (fp) {
+        fprintf(fp, " macaddrs %d", n);
+    } else {
+        printf(" macaddrs %d", n);
+    }
+
+    if (bond_mac_or_null) {
+        rte_ether_format_addr(mac2_str, sizeof(mac2_str), bond_mac_or_null);
+        if (fp) {
+            fprintf(fp, " has_bond_mac %d(bond=%s)", has_bond_mac, mac2_str);
+        } else {
+            printf(" has_bond_mac %d(bond=%s)", has_bond_mac, mac2_str);
+        }
+    }
+
+    if (fp) {
+        fprintf(fp, " [");
+    } else {
+        printf(" [");
+    }
+    for (i = 0; i < n; i++) {
+        rte_ether_format_addr(mac_str, sizeof(mac_str), &macs[i]);
+        if (fp) {
+            fprintf(fp, "%s%s", i ? " " : "", mac_str);
+        } else {
+            printf("%s%s", i ? " " : "", mac_str);
+        }
+    }
+    if (fp) {
+        fprintf(fp, "]\n");
+    } else {
+        printf("]\n");
+    }
+}
+
 static void net_stats_print_bond_debug(FILE *fp)
 {
     struct netif_port *port = NULL;
@@ -569,18 +687,28 @@ static void net_stats_print_bond_debug(FILE *fp)
     int slave_num = 0;
     int active_num = 0;
     int i = 0;
+    int print_stats = 0;
+    int print_mac = 0;
+
+    static struct rte_eth_stats last_stats[RTE_MAX_ETHPORTS];
+    static uint8_t last_stats_valid[RTE_MAX_ETHPORTS];
 
     if (!net_stats_bond_debug_enabled()) {
         return;
     }
+    print_stats = net_stats_bond_debug_stats_enabled();
+    print_mac = net_stats_bond_debug_mac_enabled();
 
     config_for_each_port(&g_config, port) {
         if (!port->bond) {
             continue;
         }
+        struct rte_ether_addr bond_mac;
 
         slave_num = port->pci_num;
         active_num = rte_eth_bond_active_slaves_get(port->id, slaves, BOND_SLAVE_MAX);
+        memset(&bond_mac, 0, sizeof(bond_mac));
+        rte_eth_macaddr_get(port->id, &bond_mac);
         if (fp) {
             fprintf(fp, "bond portId %u mode %u policy %u slaves %d active %d",
                     port->id, port->bond_mode, port->bond_policy, slave_num, active_num);
@@ -612,6 +740,10 @@ static void net_stats_print_bond_debug(FILE *fp)
             fputc('\n', fp);
         } else {
             putchar('\n');
+        }
+
+        if (print_mac) {
+            net_stats_print_macaddrs(fp, "  bond", port->id, NULL);
         }
 
         for (i = 0; i < slave_num; i++) {
@@ -676,6 +808,68 @@ static void net_stats_print_bond_debug(FILE *fp)
                 } else {
                     printf("  slave %u link %s %uMbps\n",
                            sid, link.link_status ? "up" : "down", link.link_speed);
+                }
+            }
+
+            if (print_mac) {
+                char prefix[64];
+                snprintf(prefix, sizeof(prefix), "    slave %u", sid);
+                net_stats_print_macaddrs(fp, prefix, sid, &bond_mac);
+            }
+
+            if (print_stats) {
+                struct rte_eth_stats st;
+                struct rte_eth_stats prev;
+                uint64_t d_rx = 0;
+                uint64_t d_tx = 0;
+                uint64_t d_miss = 0;
+                uint64_t d_ierr = 0;
+                uint64_t d_oerr = 0;
+                uint64_t d_nobuf = 0;
+                char rx[STATS_BUF_LEN];
+                char tx[STATS_BUF_LEN];
+                char miss[STATS_BUF_LEN];
+                char ierr[STATS_BUF_LEN];
+                char oerr[STATS_BUF_LEN];
+                char nobuf[STATS_BUF_LEN];
+
+                memset(&st, 0, sizeof(st));
+                if (rte_eth_stats_get(sid, &st) == 0 && sid < RTE_MAX_ETHPORTS) {
+                    memset(&prev, 0, sizeof(prev));
+                    if (last_stats_valid[sid]) {
+                        prev = last_stats[sid];
+                    }
+
+                    d_rx = net_stats_counter_delta(st.ipackets, prev.ipackets);
+                    d_tx = net_stats_counter_delta(st.opackets, prev.opackets);
+                    d_miss = net_stats_counter_delta(st.imissed, prev.imissed);
+                    d_ierr = net_stats_counter_delta(st.ierrors, prev.ierrors);
+                    d_oerr = net_stats_counter_delta(st.oerrors, prev.oerrors);
+                    d_nobuf = net_stats_counter_delta(st.rx_nombuf, prev.rx_nombuf);
+
+                    last_stats[sid] = st;
+                    last_stats_valid[sid] = 1;
+
+                    net_stats_format_print3(d_rx, rx, STATS_BUF_LEN, 10, 0);
+                    net_stats_format_print3(d_tx, tx, STATS_BUF_LEN, 10, 0);
+                    net_stats_format_print3(d_miss, miss, STATS_BUF_LEN, 10, d_miss != 0);
+                    net_stats_format_print3(d_ierr, ierr, STATS_BUF_LEN, 10, d_ierr != 0);
+                    net_stats_format_print3(d_oerr, oerr, STATS_BUF_LEN, 10, d_oerr != 0);
+                    net_stats_format_print3(d_nobuf, nobuf, STATS_BUF_LEN, 10, d_nobuf != 0);
+
+                    if (fp) {
+                        fprintf(fp, "    stats rx %s tx %s miss %s ierr %s oerr %s nobuf %s\n",
+                                rx, tx, miss, ierr, oerr, nobuf);
+                    } else {
+                        printf("    stats rx %s tx %s miss %s ierr %s oerr %s nobuf %s\n",
+                               rx, tx, miss, ierr, oerr, nobuf);
+                    }
+                } else {
+                    if (fp) {
+                        fprintf(fp, "    stats (eth_stats unavailable)\n");
+                    } else {
+                        printf("    stats (eth_stats unavailable)\n");
+                    }
                 }
             }
         }
