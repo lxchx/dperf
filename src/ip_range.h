@@ -63,11 +63,22 @@ static inline int ip_range_init(struct ip_range *ip_range, ipaddr_t start, int n
     uint32_t t = 0;
 
     /*
-     * 1. the last byte cannot be 0 or 255, which are illegal unicast addresses.
-     * 2. address cannot be 0.0.0.0
+     * 1. the last byte cannot be 0, which is often a network address.
+     * 2. the last byte 255 is allowed ONLY when num == 1 (single host), to
+     *    support non-/24 networks where x.x.x.255 may be a valid unicast.
+     * 3. address cannot be 0.0.0.0
      */
-    if ((ip == 0) || (num <= 0) || ((last_byte + num - 1) >= 255)) {
+    if ((ip == 0) || (num <= 0) || (last_byte == 0)) {
         return -1;
+    }
+    if (last_byte == 255) {
+        if (num != 1) {
+            return -1;
+        }
+    } else {
+        if ((last_byte + num - 1) >= 255) {
+            return -1;
+        }
     }
 
     for (i = 0; i < num; i++) {
@@ -96,7 +107,7 @@ static inline int ip_range_add(struct ip_range *ip_range, ipaddr_t addr)
     }
 
     last = addr.byte[15];
-    if ((last == 0) || (last == 255)) {
+    if (last == 0) {
         return -1;
     }
     if (ip_range->valid[last] == 0) {

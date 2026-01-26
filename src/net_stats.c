@@ -23,9 +23,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+
+#include <rte_eth_bond.h>
+#include <rte_eth_bond_8023ad.h>
 
 #include "cpuload.h"
 #include "work_space.h"
@@ -531,6 +535,118 @@ static void net_stats_print_eth(FILE *fp)
     }
 }
 
+static inline int net_stats_bond_debug_enabled(void)
+{
+    static int enabled = -1;
+    const char *val;
+
+    if (enabled != -1) {
+        return enabled;
+    }
+    val = getenv("DPERF_BOND_DEBUG");
+    enabled = (val != NULL && val[0] != '\0' && val[0] != '0');
+    return enabled;
+}
+
+static void net_stats_print_bond_debug(FILE *fp)
+{
+    struct netif_port *port = NULL;
+    uint16_t slaves[BOND_SLAVE_MAX] = {0};
+    int slave_num = 0;
+    int active_num = 0;
+    int i = 0;
+
+    if (!net_stats_bond_debug_enabled()) {
+        return;
+    }
+
+    config_for_each_port(&g_config, port) {
+        if (!port->bond) {
+            continue;
+        }
+
+        slave_num = port->pci_num;
+        active_num = rte_eth_bond_active_slaves_get(port->id, slaves, BOND_SLAVE_MAX);
+        if (fp) {
+            fprintf(fp, "bond portId %u mode %u policy %u slaves %d active %d",
+                    port->id, port->bond_mode, port->bond_policy, slave_num, active_num);
+        } else {
+            printf("bond portId %u mode %u policy %u slaves %d active %d",
+                   port->id, port->bond_mode, port->bond_policy, slave_num, active_num);
+        }
+
+        if (port->bond_mode == BONDING_MODE_8023AD) {
+            struct rte_eth_bond_8023ad_conf conf;
+
+            memset(&conf, 0, sizeof(conf));
+            if (rte_eth_bond_8023ad_conf_get(port->id, &conf) == 0) {
+                if (fp) {
+                    fprintf(fp, " lacp fast %ums slow %ums short_to %ums long_to %ums tx %ums",
+                            conf.fast_periodic_ms, conf.slow_periodic_ms,
+                            conf.short_timeout_ms, conf.long_timeout_ms,
+                            conf.tx_period_ms);
+                } else {
+                    printf(" lacp fast %ums slow %ums short_to %ums long_to %ums tx %ums",
+                           conf.fast_periodic_ms, conf.slow_periodic_ms,
+                           conf.short_timeout_ms, conf.long_timeout_ms,
+                           conf.tx_period_ms);
+                }
+            }
+        }
+
+        if (fp) {
+            fputc('\n', fp);
+        } else {
+            putchar('\n');
+        }
+
+        for (i = 0; i < slave_num; i++) {
+            uint16_t sid = port->port_id_list[i];
+            struct rte_eth_link link;
+            int collect = -1;
+            int distrib = -1;
+
+            memset(&link, 0, sizeof(link));
+            rte_eth_link_get_nowait(sid, &link);
+            if (port->bond_mode == BONDING_MODE_8023AD) {
+                collect = rte_eth_bond_8023ad_ext_collect_get(port->id, sid);
+                distrib = rte_eth_bond_8023ad_ext_distrib_get(port->id, sid);
+            }
+
+            if (fp) {
+                fprintf(fp, "  slave %u link %s %uMbps collect %d distrib %d\n",
+                        sid, link.link_status ? "up" : "down",
+                        link.link_speed, collect, distrib);
+            } else {
+                printf("  slave %u link %s %uMbps collect %d distrib %d\n",
+                       sid, link.link_status ? "up" : "down",
+                       link.link_speed, collect, distrib);
+            }
+
+            if (port->bond_mode == BONDING_MODE_8023AD) {
+                struct rte_eth_bond_8023ad_slave_info info;
+
+                memset(&info, 0, sizeof(info));
+                if (rte_eth_bond_8023ad_slave_info(port->id, sid, &info) == 0) {
+                    const char *timeout = (info.actor_state & STATE_LACP_SHORT_TIMEOUT) ? "short" : "long";
+                    int sync = !!(info.actor_state & STATE_SYNCHRONIZATION);
+                    int expired = !!(info.actor_state & STATE_EXPIRED);
+                    int defaulted = !!(info.actor_state & STATE_DEFAULTED);
+                    if (fp) {
+                        fprintf(fp, "    lacp sel %d timeout %s sync %d expired %d defaulted %d actor_state 0x%02x partner_state 0x%02x agg_port %u\n",
+                                info.selected, timeout, sync, expired, defaulted,
+                                info.actor_state, info.partner_state, info.agg_port_id);
+                    } else {
+                        printf("    lacp sel %d timeout %s sync %d expired %d defaulted %d actor_state 0x%02x partner_state 0x%02x agg_port %u\n",
+                               info.selected, timeout, sync, expired, defaulted,
+                               info.actor_state, info.partner_state, info.agg_port_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #define NET_STATS_BUF_LEN   (1024*8)
 static char g_net_stats_buf[NET_STATS_BUF_LEN];
 
@@ -563,6 +679,7 @@ void net_stats_print_speed(FILE *fp, int seconds)
     buf_skip(p, len, ret);
     net_stats_output(fp, g_net_stats_buf);
     net_stats_print_eth(fp);
+    net_stats_print_bond_debug(fp);
 
     if (fp) {
         fflush(fp);
