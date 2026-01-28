@@ -2463,7 +2463,13 @@ static int config_check_flow(struct config *cfg)
 
     config_for_each_port(cfg, port) {
         if (port->queue_num != port->server_ip_range.num) {
-            rss = 1;
+            if ((cfg->flow != FLOW_RSS) && (!cfg->vxlan) && (cfg->protocol == IPPROTO_TCP) && (!cfg->server) &&
+                (port->server_ip_range.num == 1) && (cfg->listen_num > 1) && (cfg->listen_num == port->queue_num)) {
+                /* Allow FDIR steering by listen port when there is only one server IP. */
+                continue;
+            } else {
+                rss = 1;
+            }
         }
     }
 
@@ -2889,8 +2895,17 @@ uint32_t config_get_total_socket_num(struct config *cfg, int id)
             num += config_client_ip_range_socket_num(cfg, client_ip_range);
         }
     } else {
+        uint32_t listen_num = (uint32_t)cfg->listen_num;
+        uint32_t lport_num = (uint32_t)(cfg->lport_max - cfg->lport_min + 1);
+
+        if ((cfg->flow == FLOW_FDIR) && (!cfg->vxlan) && (cfg->protocol == IPPROTO_TCP) &&
+            (port->server_ip_range.num == 1) && (cfg->listen_num > 1) && (cfg->listen_num == port->queue_num)) {
+            /* One listen port per worker (queue_id). */
+            listen_num = 1;
+        }
+
         client_ip_range = &(port->client_ip_range);
-        num = config_client_ip_range_socket_num(cfg, client_ip_range);
+        num = client_ip_range->num * listen_num * lport_num;
     }
 
     if (cfg->flow == FLOW_FDIR) {

@@ -164,6 +164,7 @@ int socket_table_init(struct work_space *ws)
     struct config *cfg = ws->cfg;
     struct netif_port *port = ws->port;
     struct socket_table *st = &ws->socket_table;
+    bool fdir_by_port = false;
 
     if (cfg->flow == FLOW_FDIR) {
         server_ip_host = ntohl(ip_range_get(&port->server_ip_range, ws->queue_id));
@@ -179,9 +180,18 @@ int socket_table_init(struct work_space *ws)
 
     st->server_ip_port_num = st->server_ip_num * cfg->listen_num;
 
-    st->server_port_min = cfg->listen;
-    st->server_port_max = cfg->listen + cfg->listen_num - 1;
-    st->server_port_num = cfg->listen_num;
+    fdir_by_port = (cfg->flow == FLOW_FDIR) && (!cfg->vxlan) && (cfg->protocol == IPPROTO_TCP) && (!cfg->server) &&
+        (port->server_ip_range.num == 1) && (cfg->listen_num > 1) && (cfg->listen_num == port->queue_num);
+    if (fdir_by_port) {
+        st->server_port_min = cfg->listen + ws->queue_id;
+        st->server_port_max = st->server_port_min;
+        st->server_port_num = 1;
+        st->server_ip_port_num = st->server_ip_num * st->server_port_num;
+    } else {
+        st->server_port_min = cfg->listen;
+        st->server_port_max = cfg->listen + cfg->listen_num - 1;
+        st->server_port_num = cfg->listen_num;
+    }
 
     st->client_port_min = cfg->lport_min;
     st->client_port_max = cfg->lport_max;

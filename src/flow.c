@@ -33,10 +33,11 @@
 
 #include <stdint.h>
 #include <rte_flow.h>
+#include <rte_byteorder.h>
 
 #include "config.h"
 
-#define MAX_PATTERN_NUM		4
+#define MAX_PATTERN_NUM		5
 
 static void flow_pattern_init_eth(struct rte_flow_item *pattern, struct rte_flow_item_eth *spec,
     struct rte_flow_item_eth *mask)
@@ -126,6 +127,33 @@ static void flow_pattern_init_end(struct rte_flow_item *pattern)
     pattern->type = RTE_FLOW_ITEM_TYPE_END;
 }
 
+static void flow_pattern_init_tcp(struct rte_flow_item *pattern, struct rte_flow_item_tcp *spec,
+    struct rte_flow_item_tcp *mask, uint16_t sport, uint16_t dport)
+{
+    uint16_t smask = 0;
+    uint16_t dmask = 0;
+
+    if (sport != 0) {
+        smask = 0xffff;
+    }
+    if (dport != 0) {
+        dmask = 0xffff;
+    }
+
+    memset(spec, 0, sizeof(struct rte_flow_item_tcp));
+    spec->hdr.src_port = rte_cpu_to_be_16(sport);
+    spec->hdr.dst_port = rte_cpu_to_be_16(dport);
+
+    memset(mask, 0, sizeof(struct rte_flow_item_tcp));
+    mask->hdr.src_port = rte_cpu_to_be_16(smask);
+    mask->hdr.dst_port = rte_cpu_to_be_16(dmask);
+
+    memset(pattern, 0, sizeof(struct rte_flow_item));
+    pattern->type = RTE_FLOW_ITEM_TYPE_TCP;
+    pattern->spec = spec;
+    pattern->mask = mask;
+}
+
 static void flow_action_init(struct rte_flow_action *action, struct rte_flow_action_queue *queue, uint16_t rxq)
 {
     memset(action, 0, sizeof(struct rte_flow_action) * 2);
@@ -183,22 +211,84 @@ static int flow_new(uint8_t port_id, uint16_t rxq, ipaddr_t sip, ipaddr_t dip, b
     return flow_create(port_id, pattern, action);
 }
 
-static int flow_init_port(struct netif_port *port, bool server, bool ipv6)
+static int flow_new_tcp(uint8_t port_id, uint16_t rxq, ipaddr_t sip, ipaddr_t dip, bool ipv6,
+    uint16_t sport, uint16_t dport)
+{
+    struct rte_flow_action_queue queue;
+    struct rte_flow_item_eth eth_spec, eth_mask;
+    struct rte_flow_item_ipv4 ip_spec, ip_mask;
+    struct rte_flow_item_ipv6 ip6_spec, ip6_mask;
+    struct rte_flow_item_tcp tcp_spec, tcp_mask;
+    struct rte_flow_item pattern[MAX_PATTERN_NUM];
+    struct rte_flow_action action[MAX_PATTERN_NUM];
+
+    flow_action_init(action, &queue, rxq);
+    flow_pattern_init_eth(&pattern[0], &eth_spec, &eth_mask);
+    if (ipv6) {
+        flow_pattern_init_ipv6(&pattern[1], &ip6_spec, &ip6_mask, sip, dip);
+    } else {
+        flow_pattern_init_ipv4(&pattern[1], &ip_spec, &ip_mask, sip.ip, dip.ip);
+    }
+    flow_pattern_init_tcp(&pattern[2], &tcp_spec, &tcp_mask, sport, dport);
+    flow_pattern_init_end(&pattern[3]);
+
+    return flow_create(port_id, pattern, action);
+}
+
+static inline bool flow_fdir_by_listen_port(const struct config *cfg, const struct netif_port *port)
+{
+    if (cfg->flow != FLOW_FDIR) {
+        return false;
+    }
+    if (cfg->vxlan) {
+        return false;
+    }
+    if (cfg->protocol != IPPROTO_TCP) {
+        return false;
+    }
+    if (cfg->server) {
+        return false;
+    }
+    if (port->server_ip_range.num != 1) {
+        return false;
+    }
+    if (cfg->listen_num <= 1) {
+        return false;
+    }
+    if (cfg->listen_num != port->queue_num) {
+        return false;
+    }
+    return true;
+}
+
+static int flow_init_port(struct config *cfg, struct netif_port *port, bool server, bool ipv6)
 {
     int ret = 0;
     int queue_id = 0;
     ipaddr_t server_ip;
     ipaddr_t client_ip;
+    uint16_t listen_port = 0;
+    bool by_port = false;
 
     memset(&client_ip, 0, sizeof(ipaddr_t));
+    by_port = flow_fdir_by_listen_port(cfg, port);
     rte_flow_flush(port->id, NULL);
     for (queue_id = 0; queue_id < port->queue_num; queue_id++) {
         ip_range_get2(&port->server_ip_range, queue_id, &server_ip);
+        listen_port = (uint16_t)(cfg->listen + queue_id);
 
         if (server) {
-            ret = flow_new(port->id, queue_id, client_ip, server_ip, ipv6);
+            if (by_port) {
+                ret = flow_new_tcp(port->id, queue_id, client_ip, server_ip, ipv6, 0, listen_port);
+            } else {
+                ret = flow_new(port->id, queue_id, client_ip, server_ip, ipv6);
+            }
         } else {
-            ret = flow_new(port->id, queue_id, server_ip, client_ip, ipv6);
+            if (by_port) {
+                ret = flow_new_tcp(port->id, queue_id, server_ip, client_ip, ipv6, listen_port, 0);
+            } else {
+                ret = flow_new(port->id, queue_id, server_ip, client_ip, ipv6);
+            }
         }
 
         if (ret < 0) {
@@ -250,7 +340,7 @@ int flow_init(struct config *cfg)
                 return -1;
             }
         } else {
-            if (flow_init_port(port, cfg->server, ipv6) < 0) {
+            if (flow_init_port(cfg, port, cfg->server, ipv6) < 0) {
                 return -1;
             }
         }
